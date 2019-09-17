@@ -31,6 +31,13 @@ import org.slf4j.LoggerFactory;
 import com.mut.mybatis.interceptors.vo.PageVO;
 import com.mut.mybatis.interceptors.vo.PagedResult;
 
+import net.sf.jsqlparser.JSQLParserException;
+import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.statement.select.OrderByElement;
+import net.sf.jsqlparser.statement.select.PlainSelect;
+import net.sf.jsqlparser.statement.select.Select;
+import net.sf.jsqlparser.statement.select.SelectBody;
+
 
 /**
  * 分页
@@ -45,7 +52,7 @@ public class PageInterceptor implements Interceptor {
 
   private static final Logger LOG = LoggerFactory.getLogger(PageInterceptor.class);
 
-  private Map<String, Boolean> pageResultCheckMap = new ConcurrentHashMap<String, Boolean>();
+  private static final Map<String, Boolean> pageResultCheckMap = new ConcurrentHashMap<String, Boolean>();
 
   /**
    * 任何时候，该接口返回值都应该为LIST，否则会提示类型转换的错误
@@ -77,10 +84,6 @@ public class PageInterceptor implements Interceptor {
       return invocation.proceed();
     }
 
-
-    // LOG.info("pageInterceptor sqlid:{} , sql:{}", currentSqlId, originalSql.replaceAll("\\s+", "
-    // "));
-
     // 检查参数中是否有分页参数
     PageVO pageVO = this.getPageVO(sqlParams);
     // 如果返回值类型为分页类型，而未包含分页参数则抛出异常
@@ -88,42 +91,43 @@ public class PageInterceptor implements Interceptor {
       throw new IllegalArgumentException("resultType is PagedResult but condition not include PageVO at sqlid is " + currentSqlId);
     }
 
-    // 获取总记录数，检查是否有自定义的获取总数的Sql
-    String countSqlId = currentSqlId + "Count";
-    boolean existsCountSqlStatement = mapperConfig.getMappedStatementNames().contains(countSqlId);
-    long totalRecord = 0;
-    if (existsCountSqlStatement) {
-      MappedStatement countSqlStatement = mapperConfig.getMappedStatement(countSqlId);
-      List<Object> list = executor.query(countSqlStatement, sqlParams, RowBounds.DEFAULT, null);
-      if (list.size() > 1) {
-        throw new TooManyResultsException();
-      }
-      totalRecord = (int) list.get(0);
-    } else {
-      // TODO 
-      String countSql = String.format("SELECT COUNT(1) FROM (%s) t", originalSql);
-      try (PreparedStatement statement = connection.prepareStatement(countSql)) {
-        DefaultParameterHandler parameterHandler = new DefaultParameterHandler(mappedStatement, boundSql.getParameterObject(), boundSql);
-        parameterHandler.setParameters(statement);
-        ResultSet executeQuery = statement.executeQuery();
-        if (executeQuery.next()) {
-          totalRecord = executeQuery.getLong(1);
-        } else {
-          throw new IllegalArgumentException("not pageCount result");
+    long totalRecord = -1;
+    if (pageVO.isIncludeTotal()) {
+      // 获取总记录数，检查是否有自定义的获取总数的Sql
+      String countSqlId = currentSqlId + "Count";
+      boolean existsCountSqlStatement = mapperConfig.getMappedStatementNames().contains(countSqlId);
+
+      if (existsCountSqlStatement) {
+        MappedStatement countSqlStatement = mapperConfig.getMappedStatement(countSqlId);
+        List<Object> list = executor.query(countSqlStatement, sqlParams, RowBounds.DEFAULT, null);
+        if (list.size() > 1) {
+          throw new TooManyResultsException();
+        }
+        totalRecord = (int) list.get(0);
+      } else {
+        String delOrderBySql = delOrderBy(originalSql);
+        String countSql = String.format("SELECT COUNT(1) FROM (%s) t", delOrderBySql);
+        try (PreparedStatement statement = connection.prepareStatement(countSql)) {
+          DefaultParameterHandler parameterHandler = new DefaultParameterHandler(mappedStatement, boundSql.getParameterObject(), boundSql);
+          parameterHandler.setParameters(statement);
+          ResultSet executeQuery = statement.executeQuery();
+          if (executeQuery.next()) {
+            totalRecord = executeQuery.getLong(1);
+          } else {
+            throw new IllegalArgumentException("not pageCount result");
+          }
         }
       }
+
+      pageVO.setTotalRecord(totalRecord);
+      LOG.info("page::{}", pageVO.toString());
     }
-
-    pageVO.setTotalRecord(totalRecord);
-    LOG.info("page::{}", pageVO.toString());
-
     List<Object> pageData = null;
-    if (totalRecord > 0) {
+    if (totalRecord > 0 || totalRecord == -1) {
       String database = prepareAndCheckDatabaseType(connection);
       String pageSql = getPagedSql(database, pageVO, originalSql);
 
-      BoundSql newBoundSql =
-          new BoundSql(mappedStatement.getConfiguration(), pageSql, boundSql.getParameterMappings(), boundSql.getParameterObject());
+      BoundSql newBoundSql = new BoundSql(mapperConfig, pageSql, boundSql.getParameterMappings(), boundSql.getParameterObject());
       MappedStatement pagedMappedStatement = copyFromMappedStatement(mappedStatement, new BoundSqlSqlSource(newBoundSql));
       for (ParameterMapping mapping : boundSql.getParameterMappings()) {
         String prop = mapping.getProperty();
@@ -132,6 +136,9 @@ public class PageInterceptor implements Interceptor {
         }
       }
       pageData = executor.query(pagedMappedStatement, sqlParams, RowBounds.DEFAULT, null);
+      if (totalRecord == -1) {
+        totalRecord = pageData.size();
+      }
     }
 
     PagedResult<?> result = new PagedResult<>(totalRecord, pageData);
@@ -205,14 +212,7 @@ public class PageInterceptor implements Interceptor {
     return null;
   }
 
-  /**
-   * 获取方法
-   * 
-   * @param full
-   * @return
-   * @since 2017年8月27日
-   * @author Administrator
-   */
+  // 获取方法
   private Method getMethod(String full) {
     int dotPos = full.lastIndexOf(".");
     if (dotPos <= 0) {
@@ -232,5 +232,31 @@ public class PageInterceptor implements Interceptor {
     } catch (ClassNotFoundException e) {
       return null;
     }
+  }
+
+  // https://blog.csdn.net/yinlongfei_love/article/details/86543107
+  private String delOrderBy(String sql) {
+    try {
+      Select noOrderSelect = (Select) CCJSqlParserUtil.parse(sql);
+      SelectBody selectBody = noOrderSelect.getSelectBody();
+      PlainSelect plainSelect = (PlainSelect) selectBody;
+      List<OrderByElement> orderByElements = plainSelect.getOrderByElements();
+      if (null != orderByElements) {
+        // https://blog.csdn.net/u014676619/article/details/64222347
+        for (OrderByElement orderByElement : orderByElements) {
+          if (orderByElement.toString().contains("?")) {
+            LOG.warn("not support order by statement has parameter with sql {}", sql);
+            return sql;
+          }
+        }
+        plainSelect.setOrderByElements(null);
+      }
+      String result = noOrderSelect.toString();
+      LOG.info("delete ordered sql is {}", result);
+      return result;
+    } catch (JSQLParserException e) {
+      LOG.warn("Delete order by statement error with sql " + sql, e);
+    }
+    return sql;
   }
 }

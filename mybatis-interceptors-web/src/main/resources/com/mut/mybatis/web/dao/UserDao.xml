@@ -13,4 +13,8 @@
 	<select id="findUserVOPage" resultType="com.mut.mybatis.web.UserVO">
 		select * from userinfo where name like concat('%',#{name},'%')
 	</select>
+	
+	<select id="findOrderedUserVOPage" resultType="com.mut.mybatis.web.UserVO">
+		select * from userinfo where name like concat('%',#{name},'%') order by id
+	</select>
 </mapper>
