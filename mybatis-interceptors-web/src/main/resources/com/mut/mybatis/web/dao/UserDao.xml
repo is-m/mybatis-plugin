@@ -6,7 +6,7 @@
 		from userinfo
 	</select>
 
-	<select id="findUserMapPage" resultType="java.util.HashMap">
+	<select id="findUserMapPage" resultType="com.mut.mybatis.web.UserVO">
 		select * from userinfo
 	</select>
 

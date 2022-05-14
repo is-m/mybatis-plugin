@@ -37,6 +37,8 @@ public class PageVO implements Serializable {
    */
   private long totalRecord = 0;
 
+  private boolean includeTotal = true;
+
   public int getCurPage() {
     return curPage;
   }
@@ -90,6 +92,11 @@ public class PageVO implements Serializable {
     return "PageVO [curPage=" + curPage + ", pageSize=" + pageSize + ", totalRecord=" + totalRecord + "]";
   }
 
+  public boolean isIncludeTotal() {
+    return includeTotal;
+  }
 
-
+  public void setIncludeTotal(boolean includeTotal) {
+    this.includeTotal = includeTotal;
+  }
 }

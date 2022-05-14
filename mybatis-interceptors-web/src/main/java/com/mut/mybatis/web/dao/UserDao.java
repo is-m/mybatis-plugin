@@ -18,7 +18,9 @@ public interface UserDao {
 
   // @Select("select * from userinfo")
   // @ResultType(HashMap.class)
-  public PagedResult<List<Map<String, Object>>> findUserMapPage(PageVO page);
+  public PagedResult<UserVO> findUserMapPage(@Param("page") PageVO page);
 
   public PagedResult<UserVO> findUserVOPage(@Param("name") String name, @Param("page") PageVO page);
+
+  PagedResult<UserVO> findOrderedUserVOPage(String name, PageVO pageVO);
 }

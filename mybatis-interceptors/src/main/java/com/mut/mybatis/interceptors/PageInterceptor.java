@@ -1,16 +1,13 @@
 package com.mut.mybatis.interceptors;
 
-import java.lang.reflect.Method;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.util.Arrays;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
-
+import com.mut.mybatis.interceptors.vo.PageVO;
+import com.mut.mybatis.interceptors.vo.PagedResult;
+import net.sf.jsqlparser.JSQLParserException;
+import net.sf.jsqlparser.parser.CCJSqlParserUtil;
+import net.sf.jsqlparser.statement.select.OrderByElement;
+import net.sf.jsqlparser.statement.select.PlainSelect;
+import net.sf.jsqlparser.statement.select.Select;
+import net.sf.jsqlparser.statement.select.SelectBody;
 import org.apache.ibatis.exceptions.TooManyResultsException;
 import org.apache.ibatis.executor.Executor;
 import org.apache.ibatis.mapping.BoundSql;
@@ -28,235 +25,236 @@ import org.apache.ibatis.session.RowBounds;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.mut.mybatis.interceptors.vo.PageVO;
-import com.mut.mybatis.interceptors.vo.PagedResult;
-
-import net.sf.jsqlparser.JSQLParserException;
-import net.sf.jsqlparser.parser.CCJSqlParserUtil;
-import net.sf.jsqlparser.statement.select.OrderByElement;
-import net.sf.jsqlparser.statement.select.PlainSelect;
-import net.sf.jsqlparser.statement.select.Select;
-import net.sf.jsqlparser.statement.select.SelectBody;
+import java.lang.reflect.Method;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.ConcurrentHashMap;
 
 
 /**
  * 分页
- * 
+ * <p>
  * 目前分页存在问题，1.查询使用了参数后无法
- * 
- * @author Administrator
  *
+ * @author Administrator
  */
 @Intercepts({@Signature(type = Executor.class, method = "query", args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class})})
 public class PageInterceptor implements Interceptor {
 
-  private static final Logger LOG = LoggerFactory.getLogger(PageInterceptor.class);
+    private static final Logger LOG = LoggerFactory.getLogger(PageInterceptor.class);
 
-  private static final Map<String, Boolean> pageResultCheckMap = new ConcurrentHashMap<String, Boolean>();
+    private static final Map<String, Boolean> pageResultCheckMap = new ConcurrentHashMap<String, Boolean>();
 
-  /**
-   * 任何时候，该接口返回值都应该为LIST，否则会提示类型转换的错误
-   */
-  @Override
-  public Object intercept(Invocation invocation) throws Throwable {
-    Executor executor = (Executor) invocation.getTarget();
-    Object[] args = invocation.getArgs();
-    MappedStatement mappedStatement = (MappedStatement) args[0];
-    Object sqlParams = args[1];
+    /**
+     * 任何时候，该接口返回值都应该为LIST，否则会提示类型转换的错误
+     */
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        Executor executor = (Executor) invocation.getTarget();
+        Object[] args = invocation.getArgs();
+        MappedStatement mappedStatement = (MappedStatement) args[0];
+        Object sqlParams = args[1];
 
-    // 获取绑定的SQL
-    BoundSql boundSql = mappedStatement.getBoundSql(sqlParams);
-    String originalSql = boundSql.getSql().trim();
-    // Object parameterObject = boundSql.getParameterObject();
+        // 获取绑定的SQL
+        BoundSql boundSql = mappedStatement.getBoundSql(sqlParams);
+        String originalSql = boundSql.getSql().trim();
+        // Object parameterObject = boundSql.getParameterObject();
 
-    Configuration mapperConfig = mappedStatement.getConfiguration();
-    Connection connection = mapperConfig.getEnvironment().getDataSource().getConnection();
-    String currentSqlId = mappedStatement.getId();
+        Configuration mapperConfig = mappedStatement.getConfiguration();
+        Connection connection = mapperConfig.getEnvironment().getDataSource().getConnection();
+        String currentSqlId = mappedStatement.getId();
 
-    // 检查并设置当前执行的SQLID是否需要需要分页
-    if (!pageResultCheckMap.containsKey(currentSqlId)) {
-      Method execMethod = getMethod(currentSqlId);
-      if (execMethod == null || !Objects.equals(PagedResult.class, execMethod.getReturnType())) {
-        pageResultCheckMap.put(currentSqlId, false);
-        return invocation.proceed();
-      }
-    } else if (!pageResultCheckMap.get(currentSqlId)) {
-      return invocation.proceed();
-    }
-
-    // 检查参数中是否有分页参数
-    PageVO pageVO = this.getPageVO(sqlParams);
-    // 如果返回值类型为分页类型，而未包含分页参数则抛出异常
-    if (pageVO == null) {
-      throw new IllegalArgumentException("resultType is PagedResult but condition not include PageVO at sqlid is " + currentSqlId);
-    }
-
-    long totalRecord = -1;
-    if (pageVO.isIncludeTotal()) {
-      // 获取总记录数，检查是否有自定义的获取总数的Sql
-      String countSqlId = currentSqlId + "Count";
-      boolean existsCountSqlStatement = mapperConfig.getMappedStatementNames().contains(countSqlId);
-
-      if (existsCountSqlStatement) {
-        MappedStatement countSqlStatement = mapperConfig.getMappedStatement(countSqlId);
-        List<Object> list = executor.query(countSqlStatement, sqlParams, RowBounds.DEFAULT, null);
-        if (list.size() > 1) {
-          throw new TooManyResultsException();
+        // 检查并设置当前执行的SQLID是否需要需要分页
+        if (!pageResultCheckMap.containsKey(currentSqlId)) {
+            Method execMethod = getMethod(currentSqlId);
+            if (execMethod == null || !Objects.equals(PagedResult.class, execMethod.getReturnType())) {
+                pageResultCheckMap.put(currentSqlId, false);
+                return invocation.proceed();
+            }
+        } else if (!pageResultCheckMap.get(currentSqlId)) {
+            return invocation.proceed();
         }
-        totalRecord = (int) list.get(0);
-      } else {
-        String delOrderBySql = delOrderBy(originalSql);
-        String countSql = String.format("SELECT COUNT(1) FROM (%s) t", delOrderBySql);
-        try (PreparedStatement statement = connection.prepareStatement(countSql)) {
-          DefaultParameterHandler parameterHandler = new DefaultParameterHandler(mappedStatement, boundSql.getParameterObject(), boundSql);
-          parameterHandler.setParameters(statement);
-          ResultSet executeQuery = statement.executeQuery();
-          if (executeQuery.next()) {
-            totalRecord = executeQuery.getLong(1);
-          } else {
-            throw new IllegalArgumentException("not pageCount result");
-          }
+
+        // 检查参数中是否有分页参数
+        PageVO pageVO = this.getPageVO(sqlParams);
+        // 如果返回值类型为分页类型，而未包含分页参数则抛出异常
+        if (pageVO == null) {
+            throw new IllegalArgumentException("resultType is PagedResult but condition not include PageVO at sqlid is " + currentSqlId);
         }
-      }
 
-      pageVO.setTotalRecord(totalRecord);
-      LOG.info("page::{}", pageVO.toString());
-    }
-    List<Object> pageData = null;
-    if (totalRecord > 0 || totalRecord == -1) {
-      String database = prepareAndCheckDatabaseType(connection);
-      String pageSql = getPagedSql(database, pageVO, originalSql);
+        long totalRecord = -1;
+        if (pageVO.isIncludeTotal()) {
+            // 获取总记录数，检查是否有自定义的获取总数的Sql
+            String countSqlId = currentSqlId + "Count";
+            boolean existsCountSqlStatement = mapperConfig.getMappedStatementNames().contains(countSqlId);
 
-      BoundSql newBoundSql = new BoundSql(mapperConfig, pageSql, boundSql.getParameterMappings(), boundSql.getParameterObject());
-      MappedStatement pagedMappedStatement = copyFromMappedStatement(mappedStatement, new BoundSqlSqlSource(newBoundSql));
-      for (ParameterMapping mapping : boundSql.getParameterMappings()) {
-        String prop = mapping.getProperty();
-        if (boundSql.hasAdditionalParameter(prop)) {
-          newBoundSql.setAdditionalParameter(prop, boundSql.getAdditionalParameter(prop));
+            if (existsCountSqlStatement) {
+                MappedStatement countSqlStatement = mapperConfig.getMappedStatement(countSqlId);
+                List<Object> list = executor.query(countSqlStatement, sqlParams, RowBounds.DEFAULT, null);
+                if (list.size() > 1) {
+                    throw new TooManyResultsException();
+                }
+                totalRecord = (int) list.get(0);
+            } else {
+                String delOrderBySql = delOrderBy(originalSql);
+                String countSql = String.format("SELECT COUNT(1) FROM (%s) t", delOrderBySql);
+                try (PreparedStatement statement = connection.prepareStatement(countSql)) {
+                    DefaultParameterHandler parameterHandler = new DefaultParameterHandler(mappedStatement, boundSql.getParameterObject(), boundSql);
+                    parameterHandler.setParameters(statement);
+                    ResultSet executeQuery = statement.executeQuery();
+                    if (executeQuery.next()) {
+                        totalRecord = executeQuery.getLong(1);
+                    } else {
+                        throw new IllegalArgumentException("not pageCount result");
+                    }
+                }
+            }
+
+            pageVO.setTotalRecord(totalRecord);
+            LOG.info("page::{}", pageVO.toString());
         }
-      }
-      pageData = executor.query(pagedMappedStatement, sqlParams, RowBounds.DEFAULT, null);
-      if (totalRecord == -1) {
-        totalRecord = pageData.size();
-      }
-    }
+        List<Object> pageData = null;
+        if (totalRecord > 0 || totalRecord == -1) {
+            String database = prepareAndCheckDatabaseType(connection);
+            String pageSql = getPagedSql(database, pageVO, originalSql);
 
-    PagedResult<?> result = new PagedResult<>(totalRecord, pageData);
-    return Arrays.asList(result);
-  }
-
-  private MappedStatement copyFromMappedStatement(MappedStatement ms, SqlSource newSqlSource) {
-    MappedStatement.Builder builder = new MappedStatement.Builder(ms.getConfiguration(), ms.getId(), newSqlSource, ms.getSqlCommandType());
-    builder.resource(ms.getResource());
-    builder.fetchSize(ms.getFetchSize());
-    builder.statementType(ms.getStatementType());
-    builder.keyGenerator(ms.getKeyGenerator());
-    if (ms.getKeyProperties() != null && ms.getKeyProperties().length > 0) {
-      builder.keyProperty(ms.getKeyProperties()[0]);
-    }
-    builder.timeout(ms.getTimeout());
-    builder.parameterMap(ms.getParameterMap());
-    builder.resultMaps(ms.getResultMaps());
-    builder.resultSetType(ms.getResultSetType());
-    builder.cache(ms.getCache());
-    builder.flushCacheRequired(ms.isFlushCacheRequired());
-    builder.useCache(ms.isUseCache());
-    return builder.build();
-  }
-
-  private class BoundSqlSqlSource implements SqlSource {
-    private BoundSql boundSql;
-
-    public BoundSqlSqlSource(BoundSql boundSql) {
-      this.boundSql = boundSql;
-    }
-
-    public BoundSql getBoundSql(Object parameterObject) {
-      return boundSql;
-    }
-  }
-
-  protected String getPagedSql(String database, PageVO page, String sql) throws IllegalArgumentException {
-    int start = page.getPageStartIndex();
-    int end = start + page.getPageSize();
-    switch (database) {
-      case "oracle":
-        return "select * from ( select u.*, rownum rn from (" + sql + ") u where rownum < " + end + ") where u.rn >= " + start;
-      case "mysql":
-        return sql + " limit " + (start - 1) + "," + page.getPageSize();
-      default:
-        throw new IllegalArgumentException("unsupport database is " + database);
-    }
-  }
-
-  protected String prepareAndCheckDatabaseType(Connection connection) throws SQLException {
-    String productName = connection.getMetaData().getDatabaseProductName();
-    LOG.trace("Database productName::{} ", productName);
-    productName = productName.toLowerCase();
-    return productName;
-  }
-
-  private PageVO getPageVO(Object parameter) {
-    if (parameter instanceof Map<?, ?>) {
-      Map<?, ?> paramMap = (Map<?, ?>) parameter;
-      for (Object paramItem : paramMap.values()) {
-        if (paramItem instanceof PageVO) {
-          return (PageVO) paramItem;
+            BoundSql newBoundSql = new BoundSql(mapperConfig, pageSql, boundSql.getParameterMappings(), boundSql.getParameterObject());
+            MappedStatement pagedMappedStatement = copyFromMappedStatement(mappedStatement, new BoundSqlSqlSource(newBoundSql));
+            for (ParameterMapping mapping : boundSql.getParameterMappings()) {
+                String prop = mapping.getProperty();
+                if (boundSql.hasAdditionalParameter(prop)) {
+                    newBoundSql.setAdditionalParameter(prop, boundSql.getAdditionalParameter(prop));
+                }
+            }
+            pageData = executor.query(pagedMappedStatement, sqlParams, RowBounds.DEFAULT, null);
+            if (totalRecord == -1) {
+                totalRecord = pageData.size();
+            }
         }
-      }
-    } else if (parameter instanceof PageVO) {
-      return (PageVO) parameter;
-    } else {
-      throw new IllegalArgumentException("unknow pageVO be found");
-    }
-    return null;
-  }
 
-  // 获取方法
-  private Method getMethod(String full) {
-    int dotPos = full.lastIndexOf(".");
-    if (dotPos <= 0) {
-      throw new IllegalArgumentException("cann't get method for full info:" + full);
+        PagedResult<?> result = new PagedResult<>(totalRecord, pageData);
+        return Collections.singletonList(result);
     }
 
-    String fullClass = full.substring(0, dotPos);
-    String methodName = full.substring(dotPos + 1, full.length());
-    try {
-      Class<?> clz = Class.forName(fullClass);
-      for (Method method : clz.getDeclaredMethods()) {
-        if (methodName.equals(method.getName())) {
-          return method;
+    private MappedStatement copyFromMappedStatement(MappedStatement ms, SqlSource newSqlSource) {
+        MappedStatement.Builder builder = new MappedStatement.Builder(ms.getConfiguration(), ms.getId(), newSqlSource, ms.getSqlCommandType());
+        builder.resource(ms.getResource());
+        builder.fetchSize(ms.getFetchSize());
+        builder.statementType(ms.getStatementType());
+        builder.keyGenerator(ms.getKeyGenerator());
+        if (ms.getKeyProperties() != null && ms.getKeyProperties().length > 0) {
+            builder.keyProperty(ms.getKeyProperties()[0]);
         }
-      }
-      return null;
-    } catch (ClassNotFoundException e) {
-      return null;
+        builder.timeout(ms.getTimeout());
+        builder.parameterMap(ms.getParameterMap());
+        builder.resultMaps(ms.getResultMaps());
+        builder.resultSetType(ms.getResultSetType());
+        builder.cache(ms.getCache());
+        builder.flushCacheRequired(ms.isFlushCacheRequired());
+        builder.useCache(ms.isUseCache());
+        return builder.build();
     }
-  }
 
-  // https://blog.csdn.net/yinlongfei_love/article/details/86543107
-  private String delOrderBy(String sql) {
-    try {
-      Select noOrderSelect = (Select) CCJSqlParserUtil.parse(sql);
-      SelectBody selectBody = noOrderSelect.getSelectBody();
-      PlainSelect plainSelect = (PlainSelect) selectBody;
-      List<OrderByElement> orderByElements = plainSelect.getOrderByElements();
-      if (null != orderByElements) {
-        // https://blog.csdn.net/u014676619/article/details/64222347
-        for (OrderByElement orderByElement : orderByElements) {
-          if (orderByElement.toString().contains("?")) {
-            LOG.warn("not support order by statement has parameter with sql {}", sql);
-            return sql;
-          }
+    private static class BoundSqlSqlSource implements SqlSource {
+        private final BoundSql boundSql;
+
+        public BoundSqlSqlSource(BoundSql boundSql) {
+            this.boundSql = boundSql;
         }
-        plainSelect.setOrderByElements(null);
-      }
-      String result = noOrderSelect.toString();
-      LOG.info("delete ordered sql is {}", result);
-      return result;
-    } catch (JSQLParserException e) {
-      LOG.warn("Delete order by statement error with sql " + sql, e);
+
+        @Override
+        public BoundSql getBoundSql(Object parameterObject) {
+            return boundSql;
+        }
     }
-    return sql;
-  }
+
+    protected String getPagedSql(String database, PageVO page, String sql) throws IllegalArgumentException {
+        int start = page.getPageStartIndex();
+        int end = start + page.getPageSize();
+        switch (database) {
+            case "oracle":
+                return "select * from ( select u.*, rownum rn from (" + sql + ") u where rownum < " + end + ") where u.rn >= " + start;
+            case "mysql":
+                return sql + " limit " + (start - 1) + "," + page.getPageSize();
+            default:
+                throw new IllegalArgumentException("unsupport database is " + database);
+        }
+    }
+
+    protected String prepareAndCheckDatabaseType(Connection connection) throws SQLException {
+        String productName = connection.getMetaData().getDatabaseProductName();
+        LOG.trace("Database productName::{} ", productName);
+        productName = productName.toLowerCase();
+        return productName;
+    }
+
+    private PageVO getPageVO(Object parameter) {
+        if (parameter instanceof Map<?, ?>) {
+            Map<?, ?> paramMap = (Map<?, ?>) parameter;
+            for (Object paramItem : paramMap.values()) {
+                if (paramItem instanceof PageVO) {
+                    return (PageVO) paramItem;
+                }
+            }
+        } else if (parameter instanceof PageVO) {
+            return (PageVO) parameter;
+        } else {
+            throw new IllegalArgumentException("unknow pageVO be found");
+        }
+        return null;
+    }
+
+    // 获取方法
+    private Method getMethod(String full) {
+        int dotPos = full.lastIndexOf(".");
+        if (dotPos <= 0) {
+            throw new IllegalArgumentException("cann't get method for full info:" + full);
+        }
+
+        String fullClass = full.substring(0, dotPos);
+        String methodName = full.substring(dotPos + 1, full.length());
+        try {
+            Class<?> clz = Class.forName(fullClass);
+            for (Method method : clz.getDeclaredMethods()) {
+                if (methodName.equals(method.getName())) {
+                    return method;
+                }
+            }
+            return null;
+        } catch (ClassNotFoundException e) {
+            return null;
+        }
+    }
+
+    // https://blog.csdn.net/yinlongfei_love/article/details/86543107
+    private String delOrderBy(String sql) {
+        try {
+            Select noOrderSelect = (Select) CCJSqlParserUtil.parse(sql);
+            SelectBody selectBody = noOrderSelect.getSelectBody();
+            PlainSelect plainSelect = (PlainSelect) selectBody;
+            List<OrderByElement> orderByElements = plainSelect.getOrderByElements();
+            if (null != orderByElements) {
+                // https://blog.csdn.net/u014676619/article/details/64222347
+                for (OrderByElement orderByElement : orderByElements) {
+                    if (orderByElement.toString().contains("?")) {
+                        LOG.warn("not support order by statement has parameter with sql {}", sql);
+                        return sql;
+                    }
+                }
+                plainSelect.setOrderByElements(null);
+            }
+            String result = noOrderSelect.toString();
+            LOG.info("delete ordered sql is {}", result);
+            return result;
+        } catch (JSQLParserException e) {
+            LOG.warn("Delete order by statement error with sql " + sql, e);
+        }
+        return sql;
+    }
 }
