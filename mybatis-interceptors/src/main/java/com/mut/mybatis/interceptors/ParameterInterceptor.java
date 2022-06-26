@@ -8,6 +8,8 @@ import org.apache.ibatis.plugin.Invocation;
 import org.apache.ibatis.plugin.Signature;
 import org.apache.ibatis.reflection.MetaObject;
 import org.apache.ibatis.reflection.SystemMetaObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.util.Assert;
 
@@ -22,7 +24,7 @@ import java.util.Map;
  */
 @Intercepts({@Signature(type = StatementHandler.class, method = "parameterize", args = {java.sql.Statement.class})})
 public class ParameterInterceptor implements Interceptor {
-
+    private static final Logger log = LoggerFactory.getLogger(ParameterInterceptor.class);
     private ParameterProvider parameterProvider;
 
     public ParameterInterceptor(ParameterProvider parameterProvider) {
@@ -49,7 +51,10 @@ public class ParameterInterceptor implements Interceptor {
                             paramMap.put(key, newValue);
                         } else {
                             Object actualValue = paramMap.get(key);
-                            Assert.isTrue(actualValue == null || actualValue.equals(newValue), key + " is conflict of [" + actualValue + "," + newValue + "]");
+                            boolean isConflictDynamicParameters = actualValue == null || actualValue.equals(newValue);
+                            if (isConflictDynamicParameters) {
+                                log.warn(key + "the mybatis dynamic parameter {} is conflict [old:" + actualValue + ", new:" + newValue + "]");
+                            }
                             paramMap.put(key, newValue);
                         }
                     });

@@ -10,15 +10,11 @@ import net.sf.jsqlparser.statement.select.Select;
 import net.sf.jsqlparser.statement.select.SelectBody;
 import org.apache.ibatis.exceptions.TooManyResultsException;
 import org.apache.ibatis.executor.Executor;
-import org.apache.ibatis.mapping.BoundSql;
-import org.apache.ibatis.mapping.MappedStatement;
-import org.apache.ibatis.mapping.ParameterMapping;
-import org.apache.ibatis.mapping.SqlSource;
+import org.apache.ibatis.mapping.*;
 import org.apache.ibatis.plugin.Interceptor;
 import org.apache.ibatis.plugin.Intercepts;
 import org.apache.ibatis.plugin.Invocation;
 import org.apache.ibatis.plugin.Signature;
-import org.apache.ibatis.scripting.defaults.DefaultParameterHandler;
 import org.apache.ibatis.session.Configuration;
 import org.apache.ibatis.session.ResultHandler;
 import org.apache.ibatis.session.RowBounds;
@@ -27,8 +23,6 @@ import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.Method;
 import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.Collections;
 import java.util.List;
@@ -41,6 +35,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * 分页
  * <p>
  * 目前分页存在问题，1.查询使用了参数后无法
+ * 插件开发详解
+ * https://blog.csdn.net/inrgihc/article/details/120328307
+ * SqlSource & SqlSourceBuilder
+ * https://blog.csdn.net/lxlneversettle/article/details/114380640
  *
  * @author Administrator
  */
@@ -93,31 +91,28 @@ public class PageInterceptor implements Interceptor {
             // 获取总记录数，检查是否有自定义的获取总数的Sql
             String countSqlId = currentSqlId + "Count";
             boolean existsCountSqlStatement = mapperConfig.getMappedStatementNames().contains(countSqlId);
-
             if (existsCountSqlStatement) {
                 MappedStatement countSqlStatement = mapperConfig.getMappedStatement(countSqlId);
                 List<Object> list = executor.query(countSqlStatement, sqlParams, RowBounds.DEFAULT, null);
-                if (list.size() > 1) {
-                    throw new TooManyResultsException();
-                }
-                totalRecord = (int) list.get(0);
+                totalRecord = resolveCount(countSqlId, list);
             } else {
-                String delOrderBySql = delOrderBy(originalSql);
+                String delOrderBySql = delSqlOuterOrderByStatement(originalSql);
                 String countSql = String.format("SELECT COUNT(1) FROM (%s) t", delOrderBySql);
-                try (PreparedStatement statement = connection.prepareStatement(countSql)) {
-                    DefaultParameterHandler parameterHandler = new DefaultParameterHandler(mappedStatement, boundSql.getParameterObject(), boundSql);
-                    parameterHandler.setParameters(statement);
-                    ResultSet executeQuery = statement.executeQuery();
-                    if (executeQuery.next()) {
-                        totalRecord = executeQuery.getLong(1);
-                    } else {
-                        throw new IllegalArgumentException("not pageCount result");
+                BoundSql newBoundSql = new BoundSql(mapperConfig, countSql, boundSql.getParameterMappings(), boundSql.getParameterObject());
+                MappedStatement countMappedStatement = copyFromMappedStatement(countSqlId, mappedStatement, new BoundSqlSqlSource(newBoundSql));
+                mapperConfig.addMappedStatement(countMappedStatement);
+                for (ParameterMapping mapping : boundSql.getParameterMappings()) {
+                    String prop = mapping.getProperty();
+                    if (boundSql.hasAdditionalParameter(prop)) {
+                        newBoundSql.setAdditionalParameter(prop, boundSql.getAdditionalParameter(prop));
                     }
                 }
+                List<Object> list = executor.query(countMappedStatement, sqlParams, RowBounds.DEFAULT, null);
+                totalRecord = resolveCount(countSqlId, list);
             }
 
             pageVO.setTotalRecord(totalRecord);
-            LOG.info("page::{}", pageVO.toString());
+            LOG.info("page::{}", pageVO);
         }
         List<Object> pageData = null;
         if (totalRecord > 0 || totalRecord == -1) {
@@ -142,6 +137,62 @@ public class PageInterceptor implements Interceptor {
         return Collections.singletonList(result);
     }
 
+    private long resolveCount(String mappedStatementId, List countValueList) {
+        if (countValueList == null || countValueList.isEmpty()) {
+            throw new IllegalArgumentException("the count statement [" + mappedStatementId + "] execute resultList cannot be null or empty");
+        }
+        if (countValueList.size() > 1) {
+            throw new TooManyResultsException("the count statement [" + mappedStatementId + "] execute resultList size cannot be greater than 1");
+        }
+
+        Object countValue = countValueList.get(0);
+        if (countValue instanceof Long) {
+            return (long) countValue;
+        }
+        if (countValue instanceof Integer) {
+            return ((Integer) countValue).longValue();
+        }
+        String countType = (countValue == null ? null : countValue.getClass().getName());
+        throw new IllegalArgumentException("the count statement [" + mappedStatementId + "] value type " + countType + " cannot be resolve to long value ");
+    }
+
+    private MappedStatement copyFromMappedStatement(String mappedStatementId, MappedStatement ms, SqlSource newSqlSource) {
+        MappedStatement.Builder builder = new MappedStatement.Builder(
+                ms.getConfiguration(),
+                mappedStatementId,
+                newSqlSource,
+                ms.getSqlCommandType());
+
+        builder.resource(ms.getResource());
+        builder.fetchSize(ms.getFetchSize());
+        builder.statementType(ms.getStatementType());
+        builder.keyGenerator(ms.getKeyGenerator());
+        if (ms.getKeyProperties() != null && ms.getKeyProperties().length > 0) {
+            builder.keyProperty(ms.getKeyProperties()[0]);
+        }
+        builder.timeout(ms.getTimeout());
+        builder.parameterMap(ms.getParameterMap());
+        List<ResultMap> resultMaps = ms.getResultMaps();
+        if (mappedStatementId.endsWith("Count") && resultMaps.size() > 0) {
+            if (resultMaps.size() > 1) {
+                throw new IllegalArgumentException("cannot support resultMaps.size > 1");
+            }
+            ResultMap resultMap = resultMaps.get(0);
+            ResultMap newResultMap = new ResultMap.Builder(
+                    ms.getConfiguration(),
+                    ms.getId(),
+                    Long.class,
+                    resultMap.getResultMappings(),
+                    resultMap.getAutoMapping()).build();
+            builder.resultMaps(Collections.singletonList(newResultMap));
+        }
+        builder.resultSetType(ms.getResultSetType());
+        builder.cache(ms.getCache());
+        builder.flushCacheRequired(ms.isFlushCacheRequired());
+        builder.useCache(ms.isUseCache());
+        return builder.build();
+    }
+
     private MappedStatement copyFromMappedStatement(MappedStatement ms, SqlSource newSqlSource) {
         MappedStatement.Builder builder = new MappedStatement.Builder(ms.getConfiguration(), ms.getId(), newSqlSource, ms.getSqlCommandType());
         builder.resource(ms.getResource());
@@ -161,8 +212,8 @@ public class PageInterceptor implements Interceptor {
         return builder.build();
     }
 
-    private static class BoundSqlSqlSource implements SqlSource {
-        private final BoundSql boundSql;
+    private class BoundSqlSqlSource implements SqlSource {
+        private BoundSql boundSql;
 
         public BoundSqlSqlSource(BoundSql boundSql) {
             this.boundSql = boundSql;
@@ -233,7 +284,7 @@ public class PageInterceptor implements Interceptor {
     }
 
     // https://blog.csdn.net/yinlongfei_love/article/details/86543107
-    private String delOrderBy(String sql) {
+    private String delSqlOuterOrderByStatement(String sql) {
         try {
             Select noOrderSelect = (Select) CCJSqlParserUtil.parse(sql);
             SelectBody selectBody = noOrderSelect.getSelectBody();
@@ -242,6 +293,7 @@ public class PageInterceptor implements Interceptor {
             if (null != orderByElements) {
                 // https://blog.csdn.net/u014676619/article/details/64222347
                 for (OrderByElement orderByElement : orderByElements) {
+                    // 只所以不能刪除帶?问号的语句,是因为mybatis的参数占位原因
                     if (orderByElement.toString().contains("?")) {
                         LOG.warn("not support order by statement has parameter with sql {}", sql);
                         return sql;
