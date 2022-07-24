@@ -15,13 +15,18 @@ import org.apache.ibatis.plugin.Interceptor;
 import org.apache.ibatis.plugin.Intercepts;
 import org.apache.ibatis.plugin.Invocation;
 import org.apache.ibatis.plugin.Signature;
+import org.apache.ibatis.reflection.TypeParameterResolver;
 import org.apache.ibatis.session.Configuration;
 import org.apache.ibatis.session.ResultHandler;
 import org.apache.ibatis.session.RowBounds;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.util.Assert;
+import org.springframework.util.ReflectionUtils;
 
 import java.lang.reflect.Method;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.Collections;
@@ -44,9 +49,7 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 @Intercepts({@Signature(type = Executor.class, method = "query", args = {MappedStatement.class, Object.class, RowBounds.class, ResultHandler.class})})
 public class PageInterceptor implements Interceptor {
-
     private static final Logger LOG = LoggerFactory.getLogger(PageInterceptor.class);
-
     private static final Map<String, Boolean> pageResultCheckMap = new ConcurrentHashMap<String, Boolean>();
 
     /**
@@ -65,7 +68,6 @@ public class PageInterceptor implements Interceptor {
         // Object parameterObject = boundSql.getParameterObject();
 
         Configuration mapperConfig = mappedStatement.getConfiguration();
-        Connection connection = mapperConfig.getEnvironment().getDataSource().getConnection();
         String currentSqlId = mappedStatement.getId();
 
         // 检查并设置当前执行的SQLID是否需要需要分页
@@ -116,17 +118,19 @@ public class PageInterceptor implements Interceptor {
         }
         List<Object> pageData = null;
         if (totalRecord > 0 || totalRecord == -1) {
-            String database = prepareAndCheckDatabaseType(connection);
+            String database = prepareAndCheckDatabaseType(mapperConfig);
             String pageSql = getPagedSql(database, pageVO, originalSql);
 
             BoundSql newBoundSql = new BoundSql(mapperConfig, pageSql, boundSql.getParameterMappings(), boundSql.getParameterObject());
             MappedStatement pagedMappedStatement = copyFromMappedStatement(mappedStatement, new BoundSqlSqlSource(newBoundSql));
+
             for (ParameterMapping mapping : boundSql.getParameterMappings()) {
                 String prop = mapping.getProperty();
                 if (boundSql.hasAdditionalParameter(prop)) {
                     newBoundSql.setAdditionalParameter(prop, boundSql.getAdditionalParameter(prop));
                 }
             }
+
             pageData = executor.query(pagedMappedStatement, sqlParams, RowBounds.DEFAULT, null);
             if (totalRecord == -1) {
                 totalRecord = pageData.size();
@@ -173,6 +177,8 @@ public class PageInterceptor implements Interceptor {
         builder.timeout(ms.getTimeout());
         builder.parameterMap(ms.getParameterMap());
         List<ResultMap> resultMaps = ms.getResultMaps();
+
+        // 如果statementId带有count标识，则说明是自己要创建的count语句，这里重写返回值类型为 long
         if (mappedStatementId.endsWith("Count") && resultMaps.size() > 0) {
             if (resultMaps.size() > 1) {
                 throw new IllegalArgumentException("cannot support resultMaps.size > 1");
@@ -193,7 +199,7 @@ public class PageInterceptor implements Interceptor {
         return builder.build();
     }
 
-    private MappedStatement copyFromMappedStatement(MappedStatement ms, SqlSource newSqlSource) {
+    private MappedStatement copyFromMappedStatement(MappedStatement ms, SqlSource newSqlSource) throws ClassNotFoundException {
         MappedStatement.Builder builder = new MappedStatement.Builder(ms.getConfiguration(), ms.getId(), newSqlSource, ms.getSqlCommandType());
         builder.resource(ms.getResource());
         builder.fetchSize(ms.getFetchSize());
@@ -205,6 +211,23 @@ public class PageInterceptor implements Interceptor {
         builder.timeout(ms.getTimeout());
         builder.parameterMap(ms.getParameterMap());
         builder.resultMaps(ms.getResultMaps());
+        // 基于注解的实现时返回类型依然是PageResult
+        String currentSqlId = ms.getId();
+        if (PagedResult.class.equals(ms.getResultMaps().get(0).getType())) {
+            int mapperClassNameIndexEnd = currentSqlId.lastIndexOf('.');
+            String mapperClass = currentSqlId.substring(0, mapperClassNameIndexEnd);
+            String mapperMethod = currentSqlId.substring(mapperClassNameIndexEnd + 1);
+            Class<?> clz = Class.forName(mapperClass);
+            Method[] methods = ReflectionUtils.getUniqueDeclaredMethods(clz, filter -> mapperMethod.equals(filter.getName()));
+            Assert.isTrue(methods.length == 1, "the sqlid " + currentSqlId + "  is not support pagable query ");
+            ParameterizedType type = (ParameterizedType) TypeParameterResolver.resolveReturnType(methods[0], clz);
+            Type actualTypeArgument = type.getActualTypeArguments()[0];
+            ResultMap resultMap = ms.getResultMaps().get(0);
+            ResultMap newReturnTypeResultMap = new ResultMap.Builder(ms.getConfiguration(), resultMap.getId(),
+                    (Class<?>) actualTypeArgument, resultMap.getResultMappings()
+                    , resultMap.getAutoMapping()).discriminator(resultMap.getDiscriminator()).build();
+            builder.resultMaps(Collections.singletonList(newReturnTypeResultMap));
+        }
         builder.resultSetType(ms.getResultSetType());
         builder.cache(ms.getCache());
         builder.flushCacheRequired(ms.isFlushCacheRequired());
@@ -238,11 +261,19 @@ public class PageInterceptor implements Interceptor {
         }
     }
 
-    protected String prepareAndCheckDatabaseType(Connection connection) throws SQLException {
-        String productName = connection.getMetaData().getDatabaseProductName();
-        LOG.trace("Database productName::{} ", productName);
-        productName = productName.toLowerCase();
-        return productName;
+    protected String prepareAndCheckDatabaseType(Configuration configuration) throws SQLException {
+        Connection connection = null;
+        try {
+            connection = configuration.getEnvironment().getDataSource().getConnection();
+            String productName = connection.getMetaData().getDatabaseProductName();
+            LOG.trace("Database productName::{} ", productName);
+            productName = productName.toLowerCase();
+            return productName;
+        } finally {
+            if (connection != null) {
+                connection.close();
+            }
+        }
     }
 
     private PageVO getPageVO(Object parameter) {
@@ -269,7 +300,7 @@ public class PageInterceptor implements Interceptor {
         }
 
         String fullClass = full.substring(0, dotPos);
-        String methodName = full.substring(dotPos + 1, full.length());
+        String methodName = full.substring(dotPos + 1);
         try {
             Class<?> clz = Class.forName(fullClass);
             for (Method method : clz.getDeclaredMethods()) {

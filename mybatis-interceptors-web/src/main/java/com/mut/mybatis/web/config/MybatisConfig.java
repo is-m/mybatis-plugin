@@ -26,7 +26,6 @@ public class MybatisConfig {
         org.apache.ibatis.session.Configuration configuration = sqlSessionFactory.getConfiguration();
 
         ParameterInterceptor parameterInterceptor = new ParameterInterceptor(parameterProvider);
-
         log.info("mybatis add PageInterceptor");
         configuration.addInterceptor(pageInterceptor);
 
